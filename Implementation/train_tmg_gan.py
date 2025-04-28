@@ -3,198 +3,246 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 import numpy as np
-
-from utils.losses import cosine_similarity  
+from utils.losses import cosine_similarity, pairwise_cosine_similarity
 from utils.plotting import plot_data_fitting
 
-def train_tmg_gan(model, dataloader, latent_dim=100, epochs=500, 
-                 t_d=1, t_g=1,  # Add parameters for iterations
-                 lr=0.0002, beta1=0.5, beta2=0.999, device="cuda"):
-    dc = model.dc
-    generator = model.generator
-    dc.to(device)
-    generator.to(device)
+class ModelTraining:
+    def __init__(self, model, dataloader, latent_dim=100, epochs=500, lr=0.0002, beta1=0.5, beta2=0.999, 
+                 t_d=1, t_g=1, device="cuda", validation_interval=10, checkpoint_interval=10):
+        self.model = model
+        self.dataloader = dataloader
+        self.latent_dim = latent_dim
+        self.epochs = epochs
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.t_d = t_d
+        self.t_g = t_g
+        self.device = device
+        self.validation_interval = validation_interval
+        self.checkpoint_interval = checkpoint_interval
 
-    disc_params = list(dc.shared.parameters()) + list(dc.discriminator_head.parameters())
-    gen_params = list(dc.classifier_head.parameters()) + list(generator.parameters())
+        self.dc = self.model.dc
+        self.generators = self.model.generators
+        self.num_classes = self.model.num_classes
 
-    disc_optim = optim.Adam(disc_params, lr=lr, betas=(beta1, beta2))
-    gen_optim = optim.Adam(gen_params, lr=lr, betas=(beta1, beta2))
+        self.dc.to(device)
+        for g in self.generators:
+            g.to(device)
 
-    bce = nn.BCELoss()
-    eps = 1e-8
+        self.gen_optims = [optim.Adam(g.parameters(), lr=self.lr, betas=(self.beta1, self.beta2)) for g in self.generators]
+        self.disc_optim = optim.Adam(self.dc.parameters(), lr=self.lr, betas=(self.beta1, self.beta2))
+        self.cross_entropy = nn.CrossEntropyLoss()
+        self.bce = nn.BCELoss()
+        self.eps = 1e-8
 
-    d_losses, g_losses, classifier_losses, classifier_accuracies, cos_sims = [], [], [], [], []
-    checkpoints = [10, 20, 30, 40, 50]
-    fig, axes = plt.subplots(1, len(checkpoints), figsize=(5 * len(checkpoints), 4))
-    axes = np.array(axes).ravel()
+    def train(self):
+        d_losses, g_losses, classifier_losses, classifier_accuracies, cos_sims = [], [], [], [], []
+        # 3. Set your checkpoints for 50-epoch test:
+        checkpoints = [10, 20, 30, 40, 50]  # Evenly spaced for testing
+        fig, axes = plt.subplots(1, len(checkpoints), figsize=(15, 3))
+        axes = np.array(axes).ravel()
 
-    class_idx = 1  # DoS class
+        for epoch in range(1, self.epochs + 1):
+            epoch_cos_intra, epoch_cos_inter = 0.0, 0.0
+            epoch_d_loss, epoch_g_loss, epoch_class_loss = 0.0, 0.0, 0.0
+            epoch_acc, epoch_cos_sim = 0.0, 0.0
+            num_d_batches, num_g_batches = 0, 0
 
-    for epoch in range(1, epochs + 1):
-        epoch_d_loss, epoch_g_loss, epoch_class_loss = 0.0, 0.0, 0.0
-        epoch_acc, epoch_cos_sim = 0.0, 0.0
-        num_d_batches, num_g_batches = 0, 0
+            for class_idx in range(self.num_classes):
+                epoch_batches = self.collect_epoch_batches(class_idx)
+                if len(epoch_batches) == 0:
+                    continue
 
-        # Collect data batches for this epoch
+                d_loss_sum, class_loss_sum, d_batches = self.train_discriminator(epoch_batches, class_idx)
+                epoch_d_loss += d_loss_sum
+                epoch_class_loss += class_loss_sum
+                num_d_batches += d_batches
+
+                g_loss_sum, cos_sim_sum, g_batches, intra_sim_sum, inter_sim_sum = self.train_generator(epoch_batches, class_idx)
+                epoch_g_loss += g_loss_sum
+                epoch_cos_sim += cos_sim_sum
+                epoch_cos_intra += intra_sim_sum
+                epoch_cos_inter += inter_sim_sum
+                num_g_batches += g_batches
+
+            if num_d_batches > 0: epoch_d_loss /= num_d_batches
+            if num_g_batches > 0: epoch_g_loss /= num_g_batches
+            if num_d_batches > 0: epoch_class_loss /= num_d_batches
+            if num_g_batches > 0: epoch_cos_sim /= num_g_batches
+            if num_g_batches > 0:
+                epoch_cos_intra /= num_g_batches
+                epoch_cos_inter /= num_g_batches
+
+            d_losses.append(epoch_d_loss)
+            g_losses.append(epoch_g_loss)
+            classifier_losses.append(epoch_class_loss)
+            cos_sims.append(epoch_cos_sim)
+
+            print(f"\n📘 Epoch {epoch}/{self.epochs}")
+            print(f" - Discriminator Loss: {epoch_d_loss:.4f}")
+            print(f" - Generator Loss: {epoch_g_loss:.4f}")
+            print(f" - Classifier Loss: {epoch_class_loss:.4f}")
+            print(f" - Cosine Similarity Loss (inter - intra): {epoch_cos_sim:.4f}")
+            print(f"   • Intra-class Cosine Similarity: {epoch_cos_intra:.4f}")
+            print(f"   • Inter-class Cosine Similarity: {epoch_cos_inter:.4f}")
+
+            self.plot_checkpoints(epoch, checkpoints, axes, fig)
+
+        self.final_plots(d_losses, g_losses, classifier_losses, classifier_accuracies, cos_sims, fig)
+
+    def collect_epoch_batches(self, class_idx):
         epoch_batches = []
-        for batch in dataloader:
+        for batch in self.dataloader:
             real_data, labels = batch
-            real_data, labels = real_data.to(device), labels.to(device)
-            
-            # Filter for class_idx samples only
+            real_data, labels = real_data.to(self.device), labels.to(self.device)
             mask = (labels == class_idx)
             if mask.sum() == 0:
                 continue
-                
             real_data = real_data[mask]
             labels = labels[mask]
             epoch_batches.append((real_data, labels))
-        
-        if len(epoch_batches) == 0:
-            continue
-            
-        # Loop through batches for discriminator training
-        for p in range(t_d):
-            d_batch_losses = []
-            
-            for real_data, labels in epoch_batches:
-                batch_size = real_data.size(0)
-                num_d_batches += 1
-                
-                # Generate fake samples
-                z = torch.randn(batch_size, latent_dim, device=device)
-                fake_data = generator(z)
-                
-                # --- Discriminator ---
-                disc_optim.zero_grad()
-                real_lbls = torch.ones(batch_size, 1, device=device)
-                fake_lbls = torch.zeros(batch_size, 1, device=device)
-                
-                pred_real = dc(real_data, mode='discriminator')
-                pred_fake = dc(fake_data.detach(), mode='discriminator')
-                
-                features_real = dc(real_data, mode='features')
-                logits_real = dc.classifier_head(features_real)
-                probs_real = logits_real[:, class_idx]
-                c_loss = -torch.log(probs_real + eps).mean()
-                
-                c_fake = dc(fake_data.detach(), mode='classifier')[:, class_idx]
-                
-                d_loss = bce(pred_real, real_lbls) + bce(pred_fake, fake_lbls) + c_fake.mean() + c_loss
-                d_loss.backward()
-                disc_optim.step()
-                
-                d_batch_losses.append(d_loss.item())
-                epoch_class_loss += c_loss.item()
-                
-                # Track metrics for classifier
-                with torch.no_grad():
-                    acc = (probs_real > 0.5).float().mean().item()
-                    epoch_acc += acc
-            
-            # Average loss for this discriminator iteration
-            if d_batch_losses:
-                epoch_d_loss += sum(d_batch_losses) / len(d_batch_losses)
-        
-        # Average discriminator loss across all t_d iterations
-        if t_d > 0:
-            epoch_d_loss /= t_d
-        
-        # Loop through batches for generator training
-        for q in range(t_g):
-            g_batch_losses = []
-            cos_batch_sims = []
-            
-            for real_data, labels in epoch_batches:
-                batch_size = real_data.size(0)
-                num_g_batches += 1
-                
-                # Generate fake samples
-                z = torch.randn(batch_size, latent_dim, device=device)
-                fake_data = generator(z)
-                
-                # --- Generator + Classifier ---
-                gen_optim.zero_grad()
-                
-                with torch.no_grad():
-                    features_real = dc(real_data, mode='features')
-                    probs_real = dc.classifier_head(features_real)[:, class_idx]
-                
-                features_fake = dc(fake_data, mode='features')
-                pred_fake_d = dc.discriminator_head(features_fake)
-                pred_fake_c = dc.classifier_head(features_fake)
-                class_fake = pred_fake_c[:, class_idx]
-                
-                real_lbls_g = torch.ones(batch_size, 1, device=device)  # Ensure size matches pred_fake_d
-                adv_loss = bce(pred_fake_d, real_lbls_g)
-                
-                # Calculate cosine similarity
-                with torch.no_grad():
-                    cos_intra = cosine_similarity(features_real, features_fake.detach())
-                    z_other = torch.randn(batch_size, latent_dim, device=device)
-                    fake_other = generator(z_other)
-                    features_other = dc(fake_other, mode='features')
-                    cos_inter = cosine_similarity(features_other, features_fake.detach())
-                    cos_total = cos_inter.mean() - cos_intra.mean()
-                    cos_batch_sims.append(cos_total.item())
-                
-                # Include cosine similarity in generator loss (as per algorithm)
-                g_loss = adv_loss + class_fake.mean() + cos_total
-                g_loss.backward()
-                gen_optim.step()
-                
-                g_batch_losses.append(g_loss.item())
-            
-            # Average loss for this generator iteration
-            if g_batch_losses:
-                epoch_g_loss += sum(g_batch_losses) / len(g_batch_losses)
-            if cos_batch_sims:
-                epoch_cos_sim += sum(cos_batch_sims) / len(cos_batch_sims)
-        
-        # Average generator loss across all t_g iterations
-        if t_g > 0:
-            epoch_g_loss /= t_g
-            epoch_cos_sim /= t_g
-        
-        # Scale metrics by the number of batches
-        if num_d_batches > 0:
-            epoch_class_loss /= num_d_batches
-            epoch_acc /= num_d_batches
-        
-        # Append metrics for plotting
-        d_losses.append(epoch_d_loss)
-        g_losses.append(epoch_g_loss)
-        classifier_losses.append(epoch_class_loss)
-        classifier_accuracies.append(epoch_acc)
-        cos_sims.append(epoch_cos_sim)
-        
-        print(f"[Epoch {epoch}/{epochs}] D Loss: {d_losses[-1]:.4f}, G Loss: {g_losses[-1]:.4f}, "
-              f"Class Loss: {classifier_losses[-1]:.4f}, Clf Acc: {classifier_accuracies[-1]:.4f}, "
-              f"Cos Sim: {cos_sims[-1]:.4f}",
-              f"Avg Cosine Sim: {1.0 - np.mean(cos_sims):.4f}")
-        
-        # Visualization at checkpoints 
+        return epoch_batches
+
+    def train_discriminator(self, epoch_batches, class_idx):
+        d_loss_sum, class_loss_sum, d_batches = 0.0, 0.0, 0
+
+        for real_data, labels in epoch_batches:
+            batch_size = real_data.size(0)
+            d_batches += 1
+            z = torch.randn(batch_size, self.latent_dim, device=self.device)
+            fake_data = self.generators[class_idx](z)
+            self.disc_optim.zero_grad()
+            real_lbls = torch.ones(batch_size, 1, device=self.device)
+            fake_lbls = torch.zeros(batch_size, 1, device=self.device)
+            pred_real = self.dc(real_data, mode='discriminator')
+            pred_fake = self.dc(fake_data.detach(), mode='discriminator')
+            features_real = self.dc(real_data, mode='features')
+            logits_real = self.dc.classifier_head(features_real)
+            c_loss_real = self.cross_entropy(logits_real, labels)
+            features_fake = self.dc(fake_data.detach(), mode='features')
+            logits_fake = self.dc.classifier_head(features_fake)
+            c_loss_fake = self.cross_entropy(logits_fake, torch.full_like(labels, class_idx))
+            d_loss = self.bce(pred_real, real_lbls) + self.bce(pred_fake, fake_lbls) + c_loss_real + c_loss_fake
+            d_loss.backward()
+            self.disc_optim.step()
+            d_loss_sum += d_loss.item()
+            class_loss_sum += c_loss_real.item()
+        return d_loss_sum, class_loss_sum, d_batches
+
+    def train_generator(self, epoch_batches, class_idx):
+        g_loss_sum, cos_sim_sum, g_batches = 0.0, 0.0, 0
+        intra_sim_sum, inter_sim_sum = 0.0, 0.0
+
+        for real_data, labels in epoch_batches:
+            batch_size = real_data.size(0)
+            g_batches += 1
+            z = torch.randn(batch_size, self.latent_dim, device=self.device) *2
+            fake_data = self.generators[class_idx](z)
+            self.gen_optims[class_idx].zero_grad()
+
+            features_fake = self.dc(fake_data, mode='features')
+            pred_fake_d = self.dc.discriminator_head(features_fake)
+            pred_fake_c = self.dc.classifier_head(features_fake)
+
+            # Generator Adversarial Loss (try to fool D)
+            real_lbls_g = torch.ones(batch_size, 1, device=self.device)
+            adv_loss = self.bce(pred_fake_d, real_lbls_g)
+
+            # Classification Loss
+            class_target = torch.full((batch_size,), class_idx, dtype=torch.long, device=self.device)
+            class_loss = self.cross_entropy(pred_fake_c, class_target)
+
+            # Intra-class Cosine Similarity (Eq. 2)
+            with torch.no_grad():
+                features_real = self.dc(real_data, mode='features')
+                cos_intra = cosine_similarity(features_fake, features_real).mean()  # aligned, fine
+                intra_sim_sum += cos_intra.item()
+
+            # Inter-class Cosine Similarity (Eq. 3)
+            cos_inter_total = 0.0
+            num_other_classes = 0
+
+            for other_class_idx in range(self.num_classes):
+                if other_class_idx == class_idx:
+                    continue
+                z_other = torch.randn(batch_size, self.latent_dim, device=self.device)
+                fake_other = self.generators[other_class_idx](z_other)
+                features_other = self.dc(fake_other, mode='features')
+
+                # ✅ All-to-all cosine matrix
+                cos_inter_matrix = pairwise_cosine_similarity(features_fake, features_other)
+                cos_inter_total += cos_inter_matrix.mean()
+                num_other_classes += 1
+
+            cos_inter_avg = cos_inter_total / (num_other_classes if num_other_classes > 0 else 1)
+            inter_sim_sum += cos_inter_avg.item()
+
+            # Final Cosine Similarity Loss (Eq. 4)
+            cos_total = cos_inter_avg - cos_intra
+            cos_sim_sum += cos_total.item()
+
+            # Generator Loss (Eq. 8)
+            g_loss = adv_loss + class_loss + cos_total
+            g_loss.backward()
+            self.gen_optims[class_idx].step()
+
+            g_loss_sum += g_loss.item()
+
+        return g_loss_sum, cos_sim_sum, g_batches, intra_sim_sum, inter_sim_sum
+
+    def get_fresh_batch(self, class_idx):
+        """Get a fresh batch of real data for visualization"""
+        for batch in self.dataloader:
+            real_data, labels = batch
+            real_data, labels = real_data.to(self.device), labels.to(self.device)
+            mask = (labels == class_idx)
+            if mask.sum() > 0:
+                return real_data[mask]
+        return None
+
+    def plot_checkpoints(self, epoch, checkpoints, axes, fig):
         if epoch in checkpoints:
             idx = checkpoints.index(epoch)
             ax = axes[idx]
-            ax.clear()
-            # Use the last batch from this epoch for visualization
-            if len(epoch_batches) > 0:
-                real_data, _ = epoch_batches[-1]
-                n_plot = min(200, real_data.size(0))
-                real_plot = real_data[:n_plot].detach()
-                z_plot = torch.randn(n_plot, latent_dim, device=device)
-                fake_plot = generator(z_plot)[:n_plot].detach()
-                plot_data_fitting(real_plot, fake_plot, epoch, ax)
+            
+            # Accumulate samples across ALL classes
+            all_real, all_fake = [], []
+            for class_idx in range(self.num_classes):
+                # Get fresh batch to avoid data leakage
+                real_data = self.get_fresh_batch(class_idx)
+                if real_data is None:
+                    continue
+                    
+                # Generate matching fake samples
+                n_samples = min(200, len(real_data))
+                z = torch.randn(n_samples, self.latent_dim, device=self.device)
+                fake_data = self.generators[class_idx](z).detach()
+                
+                all_real.append(real_data[:n_samples])
+                all_fake.append(fake_data[:n_samples])
+            
+            if all_real:
+                plot_data_fitting(torch.cat(all_real), torch.cat(all_fake), epoch, ax)
+            fig.tight_layout()  # Ensure proper spacing
 
-    # Final plots
-    fig.suptitle("Data Fitting Over Training (Class 1 - DoS)")
-    fig.tight_layout()
-    fig.savefig("data_fitting_dos.png", dpi=300)
-    plt.close(fig)
+    def final_plots(self, d_losses, g_losses, classifier_losses, classifier_accuracies, cos_sims, fig):
+        fig.suptitle("Data Fitting Over Training (All Classes)")
+        fig.tight_layout()
+        fig.savefig("Implementation/results/data_fitting_all_classes.png", dpi=300)
+        plt.close(fig)
+        self.save_plot(d_losses, "D Loss", "Implementation/results/discriminator_loss.png", "Loss")
+        self.save_plot(g_losses, "G Loss", "Implementation/results/generator_loss.png", "Loss")
+        self.save_plot(classifier_losses, "Classifier Loss", "Implementation/results/classifier_loss.png", "Loss")
+        self.save_plot(cos_sims, "Cosine Similarity (1-cos)", "Implementation/results/cosine_similarity.png", "1 - cos(sim)")
+        self.save_plot([1 - v for v in cos_sims], "Cosine Similarity", "Implementation/results/cosine_similarity_actual.png", "cos(sim)")
+        for k, gen in enumerate(self.generators):
+            torch.save(gen.state_dict(), f'Implementation/models/generator_class{k}.pth')
+        torch.save(self.dc.shared.state_dict(), 'Implementation/models/shared_backbone.pth')
+        torch.save(self.dc.discriminator_head.state_dict(), 'Implementation/models/discriminator_head.pth')
+        torch.save(self.dc.classifier_head.state_dict(), 'Implementation/models/classifier_head.pth')
 
-    def save_plot(data, title, filename, ylabel):
+    def save_plot(self, data, title, filename, ylabel):
         plt.figure()
         plt.plot(data, label=title)
         plt.title(title)
@@ -203,18 +251,3 @@ def train_tmg_gan(model, dataloader, latent_dim=100, epochs=500,
         plt.legend()
         plt.savefig(filename, dpi=300)
         plt.close()
-
-    save_plot(d_losses, "D Loss", "discriminator_loss.png", "Loss")
-    save_plot(g_losses, "G Loss", "generator_loss.png", "Loss")
-    save_plot(classifier_losses, "Classifier Loss", "classifier_loss.png", "Loss")
-    save_plot(cos_sims, "Cosine Similarity (1-cos)", "cosine_similarity.png", "1 - cos(sim)")
-    save_plot(classifier_accuracies, "Classifier Accuracy", "classifier_accuracy.png", "Accuracy")
-    save_plot([1 - v for v in cos_sims], "Cosine Similarity", "cosine_similarity_actual.png", "cos(sim)")
-
-    # Save models
-    torch.save(generator.state_dict(), 'generator_class1_dos.pth')
-    torch.save(dc.shared.state_dict(), 'shared_backbone.pth')
-    torch.save(dc.discriminator_head.state_dict(), 'discriminator_head.pth')
-    torch.save(dc.classifier_head.state_dict(), 'classifier_head.pth')
-
-    return d_losses, g_losses, classifier_losses, classifier_accuracies, cos_sims
