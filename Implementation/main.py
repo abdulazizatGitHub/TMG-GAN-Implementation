@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import DataLoader
 from architecture.tmg_gan import TMGGAN
 from utils.dataset import LoadDataset
-from train_tmg_gan import ModelTraining  # Updated to use ModelTraining
+from train_tmg_gan import ModelTraining
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -14,7 +14,7 @@ if __name__ == "__main__":
     print(f"Loaded dataset: {dataset.num_samples} samples, "
           f"{dataset.num_features} features, {dataset.num_classes} classes.")
 
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=True, drop_last=False)
+    dataloader = DataLoader(dataset, batch_size=128, shuffle=True, drop_last=False)
 
     # Initialize model
     latent_dim = 100

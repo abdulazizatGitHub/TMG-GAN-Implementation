@@ -1,13 +1,29 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
-def cosine_similarity(a, b):
-    return F.cosine_similarity(a, b, dim=1)
+class TMGCosineLoss(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.num_classes = num_classes
 
-def pairwise_cosine_similarity(A, B):
-    """
-    Returns a matrix of cosine similarities between all rows of A and all rows of B.
-    """
-    A_norm = F.normalize(A, dim=1)
-    B_norm = F.normalize(B, dim=1)
-    return torch.matmul(A_norm, B_norm.T)  # shape: [batch_size, batch_size]
+    def forward(self, real_features, fake_features, all_classes_features):
+        """
+        Args:
+            real_features: Features of REAL samples from current class [batch_size, feat_dim]
+            fake_features: Features of FAKE samples from current class [batch_size, feat_dim]
+            all_classes_features: List of features for ALL classes [num_classes, batch_size, feat_dim]
+        Returns:
+            O_k: Cosine loss value (Eq.4)
+        """
+        # Intra-class similarity (Eq.2) - Maximize
+        intra_sim = F.cosine_similarity(fake_features, real_features, dim=1).mean()
+
+        # Inter-class dissimilarity (Eq.3) - Minimize
+        inter_sim = 0
+        for k in range(self.num_classes):
+            if k != self.current_class:
+                inter_sim += F.cosine_similarity(fake_features, all_classes_features[k], dim=1).mean()
+        inter_sim /= (self.num_classes - 1)
+
+        return inter_sim - intra_sim  # Eq.4

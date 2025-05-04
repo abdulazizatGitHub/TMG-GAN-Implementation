@@ -1,21 +1,33 @@
 import torch.nn as nn
 from .generator import Generator
-from .discriminator_classifier import DiscriminatorClassifier
+from .discriminator_classifier import SharedBackbone, DiscriminatorHead, ClassifierHead
 
 class TMGGAN(nn.Module):
     def __init__(self, latent_dim, input_dim, num_classes):
-        super(TMGGAN, self).__init__()
+        super().__init__()
         self.num_classes = num_classes
         self.latent_dim = latent_dim
         self.input_dim = input_dim
-
-        # Define one generator per class
+        
+        # Shared backbone
+        self.shared_backbone = SharedBackbone(input_dim)
+        
+        # Components
         self.generators = nn.ModuleList([
             Generator(latent_dim, input_dim) for _ in range(num_classes)
         ])
+        self.discriminator = DiscriminatorHead(self.shared_backbone)
+        self.classifier = ClassifierHead(self.shared_backbone, num_classes)
 
-        # Unified discriminator + classifier
-        self.dc = DiscriminatorClassifier(input_dim, num_classes)
+    def get_features(self, x):
+        """Returns F(x) - the last hidden layer features from classifier"""
+        return self.shared_backbone(x)  # This now returns the 128-dim features
+    
+    def discriminate(self, x):
+        return self.discriminator(x)
+    
+    def classify(self, x):
+        return self.classifier(x)
 
     def generate_samples(self, z, class_idx):
         """
