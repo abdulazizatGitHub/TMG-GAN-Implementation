@@ -49,39 +49,48 @@ class ModelTraining:
             # Store all generated samples for this epoch
             all_generated_samples = {}
 
-            for class_idx in range(self.model.num_classes):
-                epoch_batches = self.collect_epoch_batches(class_idx)
-                if len(epoch_batches) == 0:
-                    continue
+            # Train Discriminator and Classifier (t_d steps)
+            for _ in range(self.t_d):
+                for class_idx in range(self.model.num_classes):
+                    epoch_batches = self.collect_epoch_batches(class_idx)
+                    if not epoch_batches:
+                        continue
+                    
+                    d_loss_sum, class_loss_sum, gen_samples, d_batches = self.train_discriminator(
+                        epoch_batches, class_idx
+                    )
+                    all_generated_samples[class_idx] = gen_samples
+                    epoch_d_loss += d_loss_sum
+                    epoch_class_loss += class_loss_sum
+                    num_d_batches += d_batches
+            
+            # Train Generators (t_g steps)
+            for _ in range(self.t_g):
+                for class_idx in range(self.model.num_classes):
+                    epoch_batches = self.collect_epoch_batches(class_idx)
+                    if not epoch_batches:
+                        continue
+                    
+                    g_loss_sum, cos_sim_sum, g_batches, intra_sim_sum, inter_sim_sum = self.train_generator(
+                        epoch_batches, class_idx, all_generated_samples
+                    )
+                    epoch_g_loss += g_loss_sum
+                    epoch_cos_sim += cos_sim_sum
+                    epoch_cos_intra += intra_sim_sum
+                    epoch_cos_inter += inter_sim_sum
+                    num_g_batches += g_batches
 
-                # Train Discriminator
-                d_loss_sum, class_loss_sum, d_batches, gen_samples = self.train_discriminator(
-                    epoch_batches, class_idx
-                )
-                
-                all_generated_samples[class_idx] = gen_samples  # Store for generator phase
-                epoch_d_loss += d_loss_sum
-                epoch_class_loss += class_loss_sum
-                num_d_batches += d_batches
-
-                # Train Generator (pass stored samples)
-                g_loss_sum, cos_sim_sum, g_batches, intra_sim_sum, inter_sim_sum = \
-                    self.train_generator(epoch_batches, class_idx, all_generated_samples)
-                
-                epoch_g_loss += g_loss_sum
-                epoch_cos_sim += cos_sim_sum
-                epoch_cos_intra += intra_sim_sum
-                epoch_cos_inter += inter_sim_sum
-                num_g_batches += g_batches
-
-            if num_d_batches > 0: epoch_d_loss /= num_d_batches
-            if num_g_batches > 0: epoch_g_loss /= num_g_batches
-            if num_d_batches > 0: epoch_class_loss /= num_d_batches
-            if num_g_batches > 0: epoch_cos_sim /= num_g_batches
+            # Normalize losses
+            if num_d_batches > 0:
+                epoch_d_loss /= num_d_batches
+                epoch_class_loss /= num_d_batches
             if num_g_batches > 0:
+                epoch_g_loss /= num_g_batches
+                epoch_cos_sim /= num_g_batches
                 epoch_cos_intra /= num_g_batches
                 epoch_cos_inter /= num_g_batches
 
+            # Store and print metrics
             d_losses.append(epoch_d_loss)
             g_losses.append(epoch_g_loss)
             classifier_losses.append(epoch_class_loss)
@@ -98,26 +107,6 @@ class ModelTraining:
             self.plot_checkpoints(epoch, checkpoints, axes, fig)
 
         self.final_plots(d_losses, g_losses, classifier_losses, cos_sims, fig)
-
-    def collect_epoch_batches(self, class_idx):
-        epoch_batches = []
-        for batch in self.dataloader:
-            real_data, labels = batch
-            real_data, labels = real_data.to(self.device), labels.to(self.device)
-            mask = (labels == class_idx)
-            # Skip if no samples of this class in the batch
-            if mask.sum() == 0:
-                continue
-            # Get samples for this class
-            class_data = real_data[mask]
-            class_labels = labels[mask]
-            
-            # Ensure batch size is valid for BatchNorm (at least 2 samples)
-            if class_data.size(0) >= 2:
-                epoch_batches.append((class_data, class_labels))
-            # If not enough samples, we'll skip this batch in training
-        
-        return epoch_batches
 
     def train_discriminator(self, epoch_batches, class_idx):
         d_loss_sum, class_loss_sum = 0.0, 0.0
@@ -157,7 +146,7 @@ class ModelTraining:
             class_loss_sum += class_loss.item()
             d_batches += 1
         
-        return d_loss_sum, class_loss_sum, d_batches, generated_samples
+        return d_loss_sum, class_loss_sum, generated_samples, d_batches
 
     def train_generator(self, epoch_batches, class_idx, all_generated_samples):
         g_loss_sum, cos_sim_sum = 0.0, 0.0
@@ -249,7 +238,27 @@ class ModelTraining:
             g_batches += 1
         
         return g_loss_sum, cos_sim_sum, g_batches, intra_sim_sum, inter_sim_sum
-
+    
+    def collect_epoch_batches(self, class_idx):
+        epoch_batches = []
+        for batch in self.dataloader:
+            real_data, labels = batch
+            real_data, labels = real_data.to(self.device), labels.to(self.device)
+            mask = (labels == class_idx)
+            # Skip if no samples of this class in the batch
+            if mask.sum() == 0:
+                continue
+            # Get samples for this class
+            class_data = real_data[mask]
+            class_labels = labels[mask]
+            
+            # Ensure batch size is valid for BatchNorm (at least 2 samples)
+            if class_data.size(0) >= 2:
+                epoch_batches.append((class_data, class_labels))
+            # If not enough samples, we'll skip this batch in training
+        
+        return epoch_batches
+    
     def get_fresh_batch(self, class_idx):
         """Get a fresh batch of real data for visualization"""
         for batch in self.dataloader:

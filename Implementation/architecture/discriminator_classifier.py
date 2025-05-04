@@ -27,7 +27,8 @@ class DiscriminatorHead(nn.Module):
         super().__init__()
         self.shared = shared_backbone
         self.head = nn.Sequential(
-            spectral_norm(nn.Linear(16, 1))
+            spectral_norm(nn.Linear(16, 1)),
+            nn.Sigmoid()
         )
         
     def forward(self, x):
